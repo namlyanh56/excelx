@@ -46,6 +46,8 @@ from telegram.ext import (
     filters,
 )
 
+import inventori
+
 # -----------------------------------------------------------------------------
 # Environment & Logging
 # -----------------------------------------------------------------------------
@@ -67,6 +69,7 @@ MAIN_MENU_START = "🚀 Mulai Ulang"
 MAIN_MENU_CREATE_DOC = "📝 Buat Dokumen Excel"
 MAIN_MENU_HELP = "ℹ️ Pusat Bantuan"
 MAIN_MENU_ADMIN = "🛡️ Admin Panel"
+MAIN_MENU_INVENTORY = inventori.INVENTORY_MENU_LABEL
 
 SUBMENU_MANUAL = "⌨️ Input Manual"
 SUBMENU_INSTANT = "⚡ Input Instan"
@@ -247,6 +250,7 @@ def touch_user(store: dict, user_id: int | None) -> None:
 def main_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(MAIN_MENU_CREATE_DOC)],
+        [KeyboardButton(MAIN_MENU_INVENTORY)],
         [KeyboardButton(MAIN_MENU_START), KeyboardButton(MAIN_MENU_HELP)],
     ]
     if is_admin:
@@ -1191,6 +1195,10 @@ async def global_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await help_handler(update, context)
         return
 
+    if text == MAIN_MENU_INVENTORY:
+        await inventori.inventory_menu_handler(update, context)
+        return
+
     if text == SUBMENU_BACK:
         await update.effective_message.reply_text(
             "🔙 Menuju Tampilan Menu Utama.",
@@ -1234,6 +1242,8 @@ def build_application() -> Application:
         )
 
     app = Application.builder().token(token).build()
+
+    inventori.register_inventory_handlers(app, guard_access)
 
     # Manual conversation
     manual_conv = ConversationHandler(
