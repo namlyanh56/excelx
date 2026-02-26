@@ -48,6 +48,7 @@ EFFECT_TADA = "5046509860389126442"
 
 PASSWORD_REGEX = re.compile(r"^[^\s]{6,64}$")
 UID_REGEX = re.compile(r"^\d{8,20}$")
+FILENAME_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 COOKIE_UID_REGEX = re.compile(r"(?:^|;)\s*c_user=(\d+)")
 COOKIE_XS_REGEX = re.compile(r"(?:^|;)\s*xs=")
 
@@ -55,6 +56,7 @@ COOKIE_XS_REGEX = re.compile(r"(?:^|;)\s*xs=")
 class InventoryStates(IntEnum):
     ASK_COOKIE = 201
     ASK_PASSWORD = 202
+    ASK_FILENAME = 203
 
 
 @dataclass
@@ -132,6 +134,27 @@ def _extract_uid(cookie: str) -> Optional[str]:
     if not UID_REGEX.fullmatch(uid):
         return None
     return uid
+
+
+def _validate_filename(raw: str) -> tuple[bool, str]:
+    s = raw.strip()
+    if not s:
+        return True, ""
+    if not FILENAME_REGEX.fullmatch(s):
+        return (
+            False,
+            "❌ <b>Nama file tidak valid.</b>\n\n"
+            "Gunakan hanya huruf, angka, underscore (_), dash (-), maksimal 50 karakter."
+        )
+    return True, ""
+
+
+def _build_filename(raw: str) -> str:
+    s = raw.strip()
+    if not s:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"inventory_export_{ts}.xlsx"
+    return f"{s}.xlsx"
 
 
 def _store_entry(user_id: int, uid: str, password: str, cookie: str) -> None:
@@ -348,12 +371,12 @@ async def inventory_password_skip_callback(update: Update, context: ContextTypes
 
 async def inventory_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer("Sesi input inventori dibatalkan.", show_alert=False)
+    await query.answer("Aksi dibatalkan.", show_alert=False)
     
     context.user_data.pop("inv_pending", None)
     
     await query.edit_message_text(
-        "❎ <i>Anda membatalkan input inventori pada sesi ini.</i>",
+        "❎ <i>Anda membatalkan aksi pada sesi ini. Proses dihentikan.</i>",
         parse_mode=ParseMode.HTML
     )
     
@@ -365,8 +388,9 @@ async def inventory_cancel_callback(update: Update, context: ContextTypes.DEFAUL
     )
     return ConversationHandler.END
 
+
 # -----------------------------------------------------------------------------
-# Start Flow (Generate XLSX)
+# Start Flow (Ask Filename & Generate XLSX)
 # -----------------------------------------------------------------------------
 
 def _build_inventory_xlsx(entries: List[InventoryEntry]) -> io.BytesIO:
@@ -435,6 +459,59 @@ async def inventory_start_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         return ConversationHandler.END
 
+    # Persiapkan UI inline
+    try:
+        tmp_msg = await update.effective_message.reply_text(
+            "🔄 <i>Menyiapkan UI...</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await tmp_msg.delete()
+    except Exception:
+        pass
+
+    await update.effective_message.reply_text(
+        "📝 <b>Pembuatan File Inventori</b>\n\n"
+        "👉 <b>Masukkan Nama File Excel</b> (tanpa .xlsx)\n"
+        "<i>* Kosongkan pesan (atau ketik bebas) jika ingin menggunakan nama waktu otomatis.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_inline_cancel_keyboard(),
+    )
+    return InventoryStates.ASK_FILENAME
+
+
+async def inventory_filename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = (update.effective_message.text or "").strip()
+
+    if raw in {INVENTORY_SUBMENU_BACK, "Batal", "/start"}:
+        await update.effective_message.reply_text(
+            "❎ Proses pembuatan file dibatalkan.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_inventory_menu_keyboard()
+        )
+        return ConversationHandler.END
+
+    ok, err = _validate_filename(raw)
+    if not ok:
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_inline_cancel_keyboard(),
+        )
+        return InventoryStates.ASK_FILENAME
+
+    user_id = _user_id(update)
+    entries = _INVENTORY_STORE.get(user_id, [])
+    
+    if not entries:
+        await update.effective_message.reply_text(
+            "⚠️ Data inventori kosong secara tiba-tiba.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_inventory_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    filename = _build_filename(raw)
     buffer = _build_inventory_xlsx(entries)
     
     await update.effective_chat.send_message(
@@ -443,7 +520,6 @@ async def inventory_start_handler(update: Update, context: ContextTypes.DEFAULT_
         message_effect_id=EFFECT_TADA
     )
 
-    filename = f"inventory_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     await update.effective_chat.send_document(
         document=InputFile(buffer, filename=filename),
         reply_markup=_inventory_menu_keyboard(),
@@ -505,8 +581,7 @@ def register_inventory_handlers(app, guard_access) -> None:
     app.add_handler(CommandHandler("inventori", inventory_menu_handler))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(INVENTORY_MENU_LABEL)}$"), inventory_menu_handler))
 
-    # Submenus
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(INVENTORY_SUBMENU_START)}$"), inventory_start_handler))
+    # Info submenu
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(INVENTORY_SUBMENU_INFO)}$"), inventory_info_handler))
 
     # Input conversation
@@ -528,6 +603,24 @@ def register_inventory_handlers(app, guard_access) -> None:
         persistent=False,
     )
     app.add_handler(inv_conv)
+
+    # Generate/Start conversation
+    gen_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(f"^{re.escape(INVENTORY_SUBMENU_START)}$"), inventory_start_handler),
+        ],
+        states={
+            InventoryStates.ASK_FILENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, inventory_filename_handler)],
+        },
+        fallbacks=[
+            CommandHandler("inventori", inventory_menu_handler),
+            CallbackQueryHandler(inventory_cancel_callback, pattern="^inv_cancel_input$"),
+        ],
+        allow_reentry=True,
+        name="inventori_gen_conversation",
+        persistent=False,
+    )
+    app.add_handler(gen_conv)
 
     # Skip callback
     app.add_handler(CallbackQueryHandler(inventory_password_skip_callback, pattern="^inv_skip_password$"))
