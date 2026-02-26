@@ -5,19 +5,22 @@ Telegram Bot: Facebook Account XLSX Generator
 - python-telegram-bot v20+
 - openpyxl
 - Modular handler architecture in a single file
-- Strict validation
+- Strict validation (rule-based)
 - ConversationHandler for interactive flows
 """
 
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import IntEnum
-from typing import List, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
 from dotenv import load_dotenv
 from openpyxl import Workbook
@@ -26,7 +29,6 @@ from telegram import (
     InputFile,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -56,15 +58,26 @@ logger = logging.getLogger("fbdocbotx")
 # Constants
 # -----------------------------------------------------------------------------
 
+MAIN_MENU_START = "🚀 Start"
 MAIN_MENU_CREATE_DOC = "📝 Buat Dokumen Excel"
 MAIN_MENU_HELP = "ℹ️ Pusat Bantuan"
+MAIN_MENU_ADMIN = "🛡️ Admin Panel"
 
 SUBMENU_MANUAL = "⌨️ Input Manual"
 SUBMENU_INSTANT = "⚡ Input Instan"
 SUBMENU_BACK = "🔙 Kembali"
+SUBMENU_CANCEL = "❌ Batal"
+
+ADMIN_MENU_WHITELIST = "✅ Kelola Whitelist"
+ADMIN_MENU_DURATION = "⏳ Atur Durasi Akses"
+ADMIN_MENU_BLOCK = "⛔ Blokir User"
+ADMIN_MENU_BROADCAST = "📣 Broadcast"
+ADMIN_MENU_STATS = "📊 Statistik"
+ADMIN_MENU_EXTRA = "🧩 Admin Tambahan"
 
 UID_REGEX = re.compile(r"^[0-9]{8,20}$")
 PASSWORD_REGEX = re.compile(r"^[^\s]{6,64}$")
+FILENAME_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 
 # Delimiter split: comma, whitespace (space/tab/newline), including multiple
 SPLIT_REGEX = re.compile(r"[,\s]+")
@@ -74,11 +87,24 @@ COOKIE_FORMAT_REGEX = re.compile(
     r"^\s*[A-Za-z0-9_]+=[^;=\n\r]+(?:;\s*[A-Za-z0-9_]+=[^;=\n\r]+)*;?\s*$"
 )
 
+DATA_STORE_FILE = Path("bot_data.json")
+
 
 class States(IntEnum):
     ASK_UID = 1
     ASK_PASSWORD = 2
     ASK_COOKIE = 3
+    ASK_FILENAME_MANUAL = 4
+    ASK_INSTANT_PAYLOAD = 5
+    ASK_FILENAME_INSTANT = 6
+
+
+class AdminStates(IntEnum):
+    MENU = 101
+    WHITELIST_INPUT = 102
+    DURATION_INPUT = 103
+    BLOCK_INPUT = 104
+    BROADCAST_INPUT = 105
 
 
 @dataclass
@@ -89,15 +115,137 @@ class ParsedInput:
 
 
 # -----------------------------------------------------------------------------
+# Config / Admin helpers
+# -----------------------------------------------------------------------------
+
+def parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS", "").strip()
+    ids: set[int] = set()
+    if not raw:
+        return ids
+    for x in raw.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ids.add(int(x))
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_utc_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def to_utc_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def load_store() -> dict:
+    if not DATA_STORE_FILE.exists():
+        return {
+            "users": {},
+            "blocked": [],
+            "stats": {
+                "total_docs_created": 0,
+                "total_messages_processed": 0,
+                "last_broadcast_at": None,
+            },
+        }
+    try:
+        return json.loads(DATA_STORE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load store; fallback to default")
+        return {
+            "users": {},
+            "blocked": [],
+            "stats": {
+                "total_docs_created": 0,
+                "total_messages_processed": 0,
+                "last_broadcast_at": None,
+            },
+        }
+
+
+def save_store(store: dict) -> None:
+    DATA_STORE_FILE.write_text(
+        json.dumps(store, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def ensure_user_record(store: dict, user_id: int) -> dict:
+    users: Dict[str, dict] = store.setdefault("users", {})
+    key = str(user_id)
+    if key not in users:
+        users[key] = {
+            "whitelisted": False,
+            "access_expires_at": None,
+            "created_docs": 0,
+            "last_seen_at": to_utc_iso(utc_now()),
+        }
+    return users[key]
+
+
+def user_is_admin(user_id: int | None) -> bool:
+    return bool(user_id and user_id in ADMIN_IDS)
+
+
+def user_is_blocked(store: dict, user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    return user_id in set(store.get("blocked", []))
+
+
+def user_has_access(store: dict, user_id: int | None) -> bool:
+    # Admin always pass
+    if user_is_admin(user_id):
+        return True
+    if not user_id:
+        return False
+    if user_is_blocked(store, user_id):
+        return False
+
+    user = ensure_user_record(store, user_id)
+    if not user.get("whitelisted", False):
+        return False
+
+    exp = parse_utc_iso(user.get("access_expires_at"))
+    if exp is None:
+        return True
+    return utc_now() <= exp
+
+
+def touch_user(store: dict, user_id: int | None) -> None:
+    if not user_id:
+        return
+    u = ensure_user_record(store, user_id)
+    u["last_seen_at"] = to_utc_iso(utc_now())
+
+
+# -----------------------------------------------------------------------------
 # Keyboard Builders
 # -----------------------------------------------------------------------------
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
+def main_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(MAIN_MENU_START), KeyboardButton(MAIN_MENU_CREATE_DOC)],
+        [KeyboardButton(MAIN_MENU_HELP)],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(MAIN_MENU_ADMIN)])
+
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(MAIN_MENU_CREATE_DOC)],
-            [KeyboardButton(MAIN_MENU_HELP)],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -107,7 +255,36 @@ def create_doc_submenu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(SUBMENU_MANUAL), KeyboardButton(SUBMENU_INSTANT)],
-            [KeyboardButton(SUBMENU_BACK)],
+            [KeyboardButton(SUBMENU_CANCEL), KeyboardButton(SUBMENU_BACK)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def active_input_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    # Keep main menu visible + quick cancel
+    rows = [
+        [KeyboardButton(MAIN_MENU_START), KeyboardButton(MAIN_MENU_CREATE_DOC)],
+        [KeyboardButton(SUBMENU_CANCEL), KeyboardButton(MAIN_MENU_HELP)],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(MAIN_MENU_ADMIN)])
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def admin_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(ADMIN_MENU_WHITELIST), KeyboardButton(ADMIN_MENU_DURATION)],
+            [KeyboardButton(ADMIN_MENU_BLOCK), KeyboardButton(ADMIN_MENU_BROADCAST)],
+            [KeyboardButton(ADMIN_MENU_STATS), KeyboardButton(ADMIN_MENU_EXTRA)],
+            [KeyboardButton(SUBMENU_CANCEL), KeyboardButton(SUBMENU_BACK)],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -119,17 +296,10 @@ def create_doc_submenu_keyboard() -> ReplyKeyboardMarkup:
 # -----------------------------------------------------------------------------
 
 def split_tokens(text: str) -> List[str]:
-    """
-    Split by comma/space/newline and strip empties.
-    """
     return [part.strip() for part in SPLIT_REGEX.split(text.strip()) if part.strip()]
 
 
 def has_delimiter(raw: str) -> bool:
-    """
-    Ensure input uses at least one delimiter among comma/space/newline.
-    Required by spec for manual UID step.
-    """
     return bool(re.search(r"[,\s]", raw))
 
 
@@ -141,7 +311,7 @@ def validate_uids(uids: Sequence[str]) -> Tuple[bool, str]:
             return (
                 False,
                 f"❌ <b>UID ke-{i} tidak valid:</b> <code>{uid}</code>\n"
-                "📌 <i>Syarat: Hanya boleh berisi angka (digit) dengan panjang 8–20 karakter.</i>",
+                "📌 <i>Syarat: Hanya digit, panjang 8–20 karakter.</i>",
             )
     return True, ""
 
@@ -168,7 +338,7 @@ def validate_cookie(cookie: str) -> Tuple[bool, str]:
     if "c_user=" not in c or "xs=" not in c:
         return False, "Cookie wajib mengandung <code>c_user=</code> dan <code>xs=</code>."
     if not COOKIE_FORMAT_REGEX.fullmatch(c):
-        return False, "Format harus <code>key=value;key=value;</code> (dipisah dengan ';')."
+        return False, "Format harus <code>key=value;key=value;</code>."
     return True, ""
 
 
@@ -185,7 +355,12 @@ def validate_cookies(cookies: Sequence[str]) -> Tuple[bool, str]:
 def parse_instant_message(text: str) -> Tuple[bool, str, ParsedInput | None]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) < 3:
-        return False, "❌ <b>Gagal! Format Input Instan memerlukan minimal 3 baris:</b>\n1️⃣ Baris UID\n2️⃣ Baris PASSWORD\n3️⃣ Baris COOKIE", None
+        return (
+            False,
+            "❌ <b>Format Input Instan minimal 3 baris:</b>\n"
+            "1️⃣ UID\n2️⃣ PASSWORD\n3️⃣ COOKIE",
+            None,
+        )
 
     uid_line, pwd_line, cookie_line = lines[0], lines[1], lines[2]
 
@@ -209,14 +384,32 @@ def parse_instant_message(text: str) -> Tuple[bool, str, ParsedInput | None]:
         return (
             False,
             "❌ <b>Jumlah data tidak seimbang!</b>\n"
-            f"📊 UID: {len(uids)}\n"
-            f"🔑 PASSWORD: {len(passwords)}\n"
-            f"🍪 COOKIE: {len(cookies)}\n\n"
-            "💡 <i>Tips: Pastikan jumlah UID, PASSWORD, dan COOKIE sama banyak.</i>",
+            f"📊 UID: {len(uids)}\n🔑 PASSWORD: {len(passwords)}\n🍪 COOKIE: {len(cookies)}",
             None,
         )
 
     return True, "", ParsedInput(uids=uids, passwords=passwords, cookies=cookies)
+
+
+def validate_filename_no_ext(raw: str) -> Tuple[bool, str]:
+    s = raw.strip()
+    if not s:
+        return True, ""  # empty allowed => default timestamp name
+    if not FILENAME_REGEX.fullmatch(s):
+        return (
+            False,
+            "❌ <b>Nama file tidak valid.</b>\n"
+            "Gunakan hanya huruf, angka, underscore (_), dash (-), maksimal 50 karakter.",
+        )
+    return True, ""
+
+
+def build_filename(raw: str) -> str:
+    s = raw.strip()
+    if not s:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"facebook_accounts_{ts}.xlsx"
+    return f"{s}.xlsx"
 
 
 # -----------------------------------------------------------------------------
@@ -234,49 +427,35 @@ def build_xlsx_file(data: ParsedInput) -> io.BytesIO:
     for uid, pwd, cookie in zip(data.uids, data.passwords, data.cookies):
         ws.append([uid, pwd, cookie])
 
-    # Styles
     header_font = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
     data_font = Font(name="Calibri", size=11)
     header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
     medium_side = Side(style="medium", color="000000")
-    all_border = Border(
-        left=medium_side, right=medium_side, top=medium_side, bottom=medium_side
-    )
+    all_border = Border(left=medium_side, right=medium_side, top=medium_side, bottom=medium_side)
 
-    # Header style
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = all_border
 
-    # Data style
     max_row = ws.max_row
     for r in range(2, max_row + 1):
         for c in range(1, 4):
             cell = ws.cell(row=r, column=c)
             cell.font = data_font
             cell.border = all_border
-            if c == 3:
-                # COOKIE wrap text enabled
-                cell.alignment = Alignment(
-                    horizontal="left", vertical="center", wrap_text=True
-                )
-            else:
-                cell.alignment = Alignment(
-                    horizontal="left", vertical="center", wrap_text=False
-                )
+            cell.alignment = Alignment(
+                horizontal="left",
+                vertical="center",
+                wrap_text=(c == 3),
+            )
 
-    # Column widths
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 25
     ws.column_dimensions["C"].width = 80
-
-    # Freeze top row and autofilter
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:C{max_row}"
-
-    # Row heights (optional polish)
     ws.row_dimensions[1].height = 24
 
     output = io.BytesIO()
@@ -286,88 +465,164 @@ def build_xlsx_file(data: ParsedInput) -> io.BytesIO:
 
 
 # -----------------------------------------------------------------------------
-# Response Helpers
+# Response Text
 # -----------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "📚 <b>PUSAT BANTUAN FBDOCBOT</b> 📚\n\n"
+    "📚 <b>PUSAT BANTUAN FBDOCBOT</b>\n\n"
     "🎯 <b>Menu Utama</b>\n"
+    "• 🚀 <b>Start:</b> Reset semua proses dan kembali ke menu utama.\n"
     "• 📝 <b>Buat Dokumen:</b> Memulai proses pembuatan file Excel.\n"
-    "• ℹ️ <b>Bantuan:</b> Menampilkan panduan penggunaan bot ini.\n\n"
-    "⌨️ <b>Input Manual (Langkah demi Langkah)</b>\n"
-    "1️⃣ Kirim daftar <b>UID</b> (pisahkan dgn spasi/koma/enter)\n"
-    "2️⃣ Kirim daftar <b>PASSWORD</b>\n"
-    "3️⃣ Kirim daftar <b>COOKIE</b>\n"
-    "<i>*Catatan: Jumlah data di setiap langkah harus seimbang.</i>\n\n"
-    "⚡ <b>Input Instan (Cepat)</b>\n"
-    "Kirim langsung 1 pesan berisi minimal 3 baris:\n"
-    "Baris 1: <code>[Daftar UID]</code>\n"
-    "Baris 2: <code>[Daftar PASSWORD]</code>\n"
-    "Baris 3: <code>[Daftar COOKIE]</code>\n\n"
-    "💡 <b>Aturan Validasi Ketat:</b>\n"
-    "• <b>UID:</b> 8-20 angka (<code>^[0-9]{8,20}$</code>)\n"
-    "• <b>PASSWORD:</b> 6-64 karakter tanpa spasi\n"
-    "• <b>COOKIE:</b> Wajib ada <code>c_user=</code> dan <code>xs=</code>\n\n"
-    "⚠️ <b>Kesalahan Umum:</b>\n"
-    "❌ Jumlah baris/data tidak sama\n"
-    "❌ Terdapat huruf/simbol pada UID\n"
-    "❌ Terdapat spasi pada PASSWORD"
+    "• ℹ️ <b>Bantuan:</b> Menampilkan panduan penggunaan.\n"
+    "• ❌ <b>Batal:</b> Menghentikan proses aktif dan reset state.\n\n"
+    "⌨️ <b>Input Manual</b>\n"
+    "1️⃣ UID\n2️⃣ PASSWORD\n3️⃣ COOKIE\n4️⃣ Nama file\n\n"
+    "⚡ <b>Input Instan</b>\n"
+    "1 pesan minimal 3 baris (UID/PASSWORD/COOKIE), lalu nama file.\n\n"
+    "💡 <b>Validasi Rule-Based:</b>\n"
+    "• UID: 8-20 digit\n"
+    "• PASSWORD: 6-64, tanpa spasi\n"
+    "• COOKIE: wajib ada c_user= dan xs=\n"
+    "• Nama file: [A-Za-z0-9_-], max 50"
 )
 
 
-async def send_xlsx_result(update: Update, context: ContextTypes.DEFAULT_TYPE, data: ParsedInput) -> None:
+# -----------------------------------------------------------------------------
+# Session / Access Helpers
+# -----------------------------------------------------------------------------
+
+def hard_reset_user_session(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+
+
+def current_user_id(update: Update) -> int | None:
+    return update.effective_user.id if update.effective_user else None
+
+
+def is_control_reset_text(text: str) -> bool:
+    return text in {MAIN_MENU_START, SUBMENU_CANCEL, "Start", "Batal"}
+
+
+async def force_back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    hard_reset_user_session(context)
+    uid = current_user_id(update)
+    is_admin = user_is_admin(uid)
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(is_admin=is_admin),
+    )
+    return ConversationHandler.END
+
+
+async def guard_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    store = load_store()
+    uid = current_user_id(update)
+    if uid is None:
+        return False
+
+    touch_user(store, uid)
+    store["stats"]["total_messages_processed"] = store["stats"].get("total_messages_processed", 0) + 1
+    save_store(store)
+
+    if user_is_blocked(store, uid):
+        await update.effective_message.reply_text(
+            "⛔ <b>Akses Anda sedang diblokir.</b>\nHubungi admin jika ini kesalahan.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(is_admin=user_is_admin(uid)),
+        )
+        return False
+
+    if not user_has_access(store, uid):
+        await update.effective_message.reply_text(
+            "🔒 <b>Anda belum memiliki akses bot.</b>\nSilakan hubungi admin untuk whitelist.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(is_admin=user_is_admin(uid)),
+        )
+        return False
+
+    return True
+
+
+# -----------------------------------------------------------------------------
+# Send Result
+# -----------------------------------------------------------------------------
+
+async def send_xlsx_result(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    data: ParsedInput,
+    filename: str,
+) -> None:
     try:
         xlsx_buffer = build_xlsx_file(data)
         await update.effective_chat.send_document(
-            document=InputFile(xlsx_buffer, filename="facebook_accounts_.xlsx"),
-            caption="🎉 <b>Yeay! Dokumen berhasil dibuat.</b>\nSilakan unduh file Excel Anda di atas. 📁✨",
-            parse_mode=ParseMode.HTML
+            document=InputFile(xlsx_buffer, filename=filename),
+            caption="🎉 <b>Dokumen berhasil dibuat!</b>\nSilakan unduh file Excel Anda. ✅",
+            parse_mode=ParseMode.HTML,
         )
+
+        store = load_store()
+        uid = current_user_id(update)
+        if uid:
+            u = ensure_user_record(store, uid)
+            u["created_docs"] = int(u.get("created_docs", 0)) + 1
+        store["stats"]["total_docs_created"] = store["stats"].get("total_docs_created", 0) + 1
+        save_store(store)
+
     except Exception:
         logger.exception("Failed to generate/send XLSX")
         await update.effective_message.reply_text(
-            "❌ <b>Terjadi kesalahan sistem</b> saat membuat file XLSX. Silakan coba beberapa saat lagi.",
-            parse_mode=ParseMode.HTML
+            "❌ <b>Terjadi kesalahan sistem</b> saat membuat file XLSX. Coba lagi beberapa saat.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
         )
 
 
-def reset_user_session(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("uids", None)
-    context.user_data.pop("passwords", None)
-
-
 # -----------------------------------------------------------------------------
-# Handlers: Core Menu
+# Core Handlers
 # -----------------------------------------------------------------------------
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reset_user_session(context)
+    hard_reset_user_session(context)
+    uid = current_user_id(update)
+    is_admin = user_is_admin(uid)
     await update.effective_message.reply_text(
-        "🎉 <b>Selamat Datang di FBDocBot!</b> 🎉\n\n"
-        "Saya siap membantu Anda menyusun data akun Facebook menjadi dokumen Excel yang rapi dan terorganisir dengan cepat. 📊✨\n\n"
-        "Silakan pilih menu di bawah ini untuk memulai:",
+        "🔥 <b>Selamat datang di FBDocBot!</b>\n\n"
+        "Semua proses sebelumnya sudah di-reset.\n"
+        "Silakan pilih menu untuk mulai. 🎯",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=is_admin),
     )
     return ConversationHandler.END
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = current_user_id(update)
     await update.effective_message.reply_text(
         HELP_TEXT,
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=user_is_admin(uid)),
     )
     return ConversationHandler.END
 
 
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await force_back_to_main_menu(
+        update,
+        context,
+        "❎ <b>Proses dibatalkan.</b>\nSemua state dibersihkan dan kembali ke menu utama.",
+    )
+
+
 async def menu_create_doc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reset_user_session(context)
+    if not await guard_access(update, context):
+        return ConversationHandler.END
+
+    hard_reset_user_session(context)
     await update.effective_message.reply_text(
-        "🛠️ <b>Menu Pembuatan Dokumen</b>\n\n"
-        "Silakan pilih metode input data yang paling nyaman untuk Anda:\n"
-        "• <b>Input Manual:</b> Dituntun langkah demi langkah.\n"
-        "• <b>Input Instan:</b> Sekali kirim langsung jadi.\n",
+        "🛠️ <b>Menu Pembuatan Dokumen</b>\n"
+        "Pilih metode input yang Anda inginkan:",
         parse_mode=ParseMode.HTML,
         reply_markup=create_doc_submenu_keyboard(),
     )
@@ -375,191 +630,488 @@ async def menu_create_doc_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 # -----------------------------------------------------------------------------
-# Handlers: Manual Flow
+# Manual Flow
 # -----------------------------------------------------------------------------
 
 async def manual_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reset_user_session(context)
+    if not await guard_access(update, context):
+        return ConversationHandler.END
+
+    hard_reset_user_session(context)
     await update.effective_message.reply_text(
-        "📌 <b>Langkah 1: Input UID</b>\n\n"
-        "Silakan masukkan daftar <b>UID</b> akun Anda.\n"
-        "<i>(Pisahkan dengan spasi, koma, atau baris baru)</i> 👇",
+        "⌨️ <b>Input Manual - Langkah 1</b>\n"
+        "Masukkan daftar UID (pisahkan spasi/koma/enter).",
         parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
     )
     return States.ASK_UID
 
 
 async def ask_uid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = (update.effective_message.text or "").strip()
+    if is_control_reset_text(raw):
+        return await cancel_handler(update, context)
 
     if not has_delimiter(raw):
         await update.effective_message.reply_text(
-            "❌ <b>Format UID ditolak.</b>\nMohon pisahkan antar UID dengan spasi, koma, atau enter (baris baru).",
-            parse_mode=ParseMode.HTML
+            "❌ Format UID ditolak. Pisahkan UID dengan spasi/koma/enter.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
         )
         return States.ASK_UID
 
     uids = split_tokens(raw)
     ok, err = validate_uids(uids)
     if not ok:
-        await update.effective_message.reply_text(err, parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+        )
         return States.ASK_UID
 
     context.user_data["uids"] = uids
     await update.effective_message.reply_text(
-        "✅ <b>UID Valid!</b>\n\n"
-        "🔐 <b>Langkah 2: Input Password</b>\n"
-        "Sekarang masukkan daftar <b>Password</b>.\n"
-        f"<i>(Pastikan jumlahnya sama persis: <b>{len(uids)}</b> password)</i> 👇",
-        parse_mode=ParseMode.HTML
+        f"✅ UID valid ({len(uids)} data).\n"
+        "🔐 <b>Langkah 2:</b> Masukkan daftar PASSWORD.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
     )
     return States.ASK_PASSWORD
 
 
 async def ask_password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = (update.effective_message.text or "").strip()
-    passwords = split_tokens(raw)
+    if is_control_reset_text(raw):
+        return await cancel_handler(update, context)
 
+    passwords = split_tokens(raw)
     ok, err = validate_passwords(passwords)
     if not ok:
-        await update.effective_message.reply_text(err, parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+        )
         return States.ASK_PASSWORD
 
     uids = context.user_data.get("uids", [])
     if len(passwords) != len(uids):
         await update.effective_message.reply_text(
-            f"❌ <b>Jumlah password tidak sesuai dengan jumlah UID!</b>\n"
-            f"📊 UID: <b>{len(uids)}</b> | 🔑 PASSWORD: <b>{len(passwords)}</b>\n\n"
-            "<i>Mohon masukkan ulang dengan jumlah yang tepat.</i>",
-            parse_mode=ParseMode.HTML
+            f"❌ Jumlah tidak sama.\nUID: {len(uids)} | PASSWORD: {len(passwords)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
         )
         return States.ASK_PASSWORD
 
     context.user_data["passwords"] = passwords
     await update.effective_message.reply_text(
-        "✅ <b>Password Valid!</b>\n\n"
-        "🍪 <b>Langkah 3: Input Cookie</b>\n"
-        "Terakhir, masukkan daftar <b>Cookie</b>.\n"
-        f"<i>(Pastikan jumlahnya sama persis: <b>{len(uids)}</b> cookie)</i> 👇",
-        parse_mode=ParseMode.HTML
+        "✅ Password valid.\n🍪 <b>Langkah 3:</b> Masukkan daftar COOKIE.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
     )
     return States.ASK_COOKIE
 
 
 async def ask_cookie_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = (update.effective_message.text or "").strip()
-    cookies = split_tokens(raw)
+    if is_control_reset_text(raw):
+        return await cancel_handler(update, context)
 
+    cookies = split_tokens(raw)
     ok, err = validate_cookies(cookies)
     if not ok:
-        await update.effective_message.reply_text(err, parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+        )
         return States.ASK_COOKIE
 
     uids = context.user_data.get("uids", [])
     passwords = context.user_data.get("passwords", [])
-
     if not (len(uids) == len(passwords) == len(cookies)):
         await update.effective_message.reply_text(
-            "❌ <b>Jumlah data tidak seimbang!</b>\n"
-            f"📊 UID: <b>{len(uids)}</b>\n"
-            f"🔑 PASSWORD: <b>{len(passwords)}</b>\n"
-            f"🍪 COOKIE: <b>{len(cookies)}</b>\n\n"
-            "<i>Mohon masukkan ulang dengan jumlah yang tepat.</i>",
-            parse_mode=ParseMode.HTML
+            "❌ Jumlah UID/PASSWORD/COOKIE harus sama.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
         )
         return States.ASK_COOKIE
 
-    # Data Valid - Generate Excel
-    parsed = ParsedInput(uids=uids, passwords=passwords, cookies=cookies)
-    
-    # Progress Message
+    context.user_data["cookies"] = cookies
+    await update.effective_message.reply_text(
+        "📝 <b>Langkah 4:</b> Masukkan nama file (tanpa .xlsx).\n"
+        "Kosongkan jika ingin default otomatis.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+    )
+    return States.ASK_FILENAME_MANUAL
+
+
+async def ask_filename_manual_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = (update.effective_message.text or "").strip()
+    if is_control_reset_text(raw):
+        return await cancel_handler(update, context)
+
+    ok, err = validate_filename_no_ext(raw)
+    if not ok:
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+        )
+        return States.ASK_FILENAME_MANUAL
+
+    filename = build_filename(raw)
+    parsed = ParsedInput(
+        uids=context.user_data.get("uids", []),
+        passwords=context.user_data.get("passwords", []),
+        cookies=context.user_data.get("cookies", []),
+    )
+
     progress_msg = await update.effective_message.reply_text(
-        "⏳ <i>Memproses data Anda. Mempersiapkan Excel...</i>",
-        parse_mode=ParseMode.HTML
+        "⏳ <i>Memproses data dan menyiapkan Excel...</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
     )
-    
-    await send_xlsx_result(update, context, parsed)
-
-    reset_user_session(context)
-    
-    # Clean up processing message & Show Main Menu again
+    await send_xlsx_result(update, context, parsed, filename)
     await progress_msg.delete()
-    await update.effective_message.reply_text(
-        "🔙 <b>Kembali ke Menu Utama</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
+
+    return await force_back_to_main_menu(
+        update,
+        context,
+        "✅ <b>Selesai.</b> Dokumen berhasil diproses. Kembali ke menu utama.",
     )
-    return ConversationHandler.END
 
 
 # -----------------------------------------------------------------------------
-# Handlers: Instant Flow
+# Instant Flow
 # -----------------------------------------------------------------------------
 
-async def instant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.effective_message.reply_text(
-        "⚡ <b>Mode Input Instan</b>\n\n"
-        "Kirimkan data Anda dalam <b>1 pesan sekaligus</b> (minimal 3 baris):\n\n"
-        "1️⃣ <b>Baris 1:</b> Daftar UID\n"
-        "2️⃣ <b>Baris 2:</b> Daftar PASSWORD\n"
-        "3️⃣ <b>Baris 3:</b> Daftar COOKIE\n\n"
-        "<b>Contoh Pesan:</b>\n"
-        "<code>12345678901234 12345678901235</code>\n"
-        "<code>Pass1234 Pass5678</code>\n"
-        "<code>c_user=aaa;xs=bbb; c_user=ccc;xs=ddd;</code> 👇",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return ConversationHandler.END
-
-
-async def instant_payload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()
-    ok, err, parsed = parse_instant_message(text)
-
-    if not ok or parsed is None:
-        await update.effective_message.reply_text(err, parse_mode=ParseMode.HTML)
+async def instant_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await guard_access(update, context):
         return ConversationHandler.END
 
+    hard_reset_user_session(context)
+    await update.effective_message.reply_text(
+        "⚡ <b>Mode Input Instan</b>\n"
+        "Kirim 1 pesan minimal 3 baris:\n"
+        "1) UID\n2) PASSWORD\n3) COOKIE",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+    )
+    return States.ASK_INSTANT_PAYLOAD
+
+
+async def ask_instant_payload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if is_control_reset_text(text):
+        return await cancel_handler(update, context)
+
+    ok, err, parsed = parse_instant_message(text)
+    if not ok or parsed is None:
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+        )
+        return States.ASK_INSTANT_PAYLOAD
+
+    context.user_data["instant_parsed"] = {
+        "uids": parsed.uids,
+        "passwords": parsed.passwords,
+        "cookies": parsed.cookies,
+    }
+    await update.effective_message.reply_text(
+        "✅ Data instan valid.\n"
+        "📝 Masukkan nama file (tanpa .xlsx), atau kirim kosong untuk default.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+    )
+    return States.ASK_FILENAME_INSTANT
+
+
+async def ask_filename_instant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = (update.effective_message.text or "").strip()
+    if is_control_reset_text(raw):
+        return await cancel_handler(update, context)
+
+    ok, err = validate_filename_no_ext(raw)
+    if not ok:
+        await update.effective_message.reply_text(
+            err,
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
+        )
+        return States.ASK_FILENAME_INSTANT
+
+    filename = build_filename(raw)
+    d = context.user_data.get("instant_parsed", {})
+    parsed = ParsedInput(
+        uids=d.get("uids", []),
+        passwords=d.get("passwords", []),
+        cookies=d.get("cookies", []),
+    )
+
     progress_msg = await update.effective_message.reply_text(
-        "⏳ <i>Memproses data instan Anda. Mempersiapkan Excel...</i>",
-        parse_mode=ParseMode.HTML
+        "⏳ <i>Memproses data instan dan menyiapkan Excel...</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=active_input_keyboard(is_admin=user_is_admin(current_user_id(update))),
     )
-
-    await send_xlsx_result(update, context, parsed)
-    
+    await send_xlsx_result(update, context, parsed, filename)
     await progress_msg.delete()
-    await update.effective_message.reply_text(
-        "🔙 <b>Kembali ke Menu Utama</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
+
+    return await force_back_to_main_menu(
+        update,
+        context,
+        "🎉 <b>Berhasil!</b> Dokumen selesai dibuat. Kembali ke menu utama.",
     )
-    return ConversationHandler.END
 
 
 # -----------------------------------------------------------------------------
-# Fallback & Global Text Router
+# Admin Handlers
 # -----------------------------------------------------------------------------
 
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reset_user_session(context)
-    await update.effective_message.reply_text(
-        "❎ <b>Proses dibatalkan.</b>\nAnda telah dikembalikan ke menu utama.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
-    )
-    return ConversationHandler.END
+async def admin_entry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = current_user_id(update)
+    if not user_is_admin(uid):
+        await update.effective_message.reply_text(
+            "⛔ <b>Akses ditolak.</b> Menu admin hanya untuk admin.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(is_admin=False),
+        )
+        return ConversationHandler.END
 
+    await update.effective_message.reply_text(
+        "🛡️ <b>Admin Panel</b>\nPilih aksi administratif.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+    return AdminStates.MENU
+
+
+async def admin_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+
+    if text in {SUBMENU_CANCEL, MAIN_MENU_START}:
+        return await cancel_handler(update, context)
+
+    if text == SUBMENU_BACK:
+        return await force_back_to_main_menu(update, context, "🔙 Kembali ke menu utama.")
+
+    if text == ADMIN_MENU_WHITELIST:
+        await update.effective_message.reply_text(
+            "Kirim format: <code>allow 123456789</code> atau <code>deny 123456789</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.WHITELIST_INPUT
+
+    if text == ADMIN_MENU_DURATION:
+        await update.effective_message.reply_text(
+            "Kirim format: <code>123456789 30</code> (durasi 30 hari).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.DURATION_INPUT
+
+    if text == ADMIN_MENU_BLOCK:
+        await update.effective_message.reply_text(
+            "Kirim format: <code>block 123456789</code> atau <code>unblock 123456789</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.BLOCK_INPUT
+
+    if text == ADMIN_MENU_BROADCAST:
+        await update.effective_message.reply_text(
+            "Kirim pesan broadcast yang ingin dikirim ke semua user terdaftar.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.BROADCAST_INPUT
+
+    if text == ADMIN_MENU_STATS:
+        store = load_store()
+        users = store.get("users", {})
+        blocked = store.get("blocked", [])
+        docs = store.get("stats", {}).get("total_docs_created", 0)
+        msgs = store.get("stats", {}).get("total_messages_processed", 0)
+
+        await update.effective_message.reply_text(
+            "📊 <b>Statistik Bot</b>\n"
+            f"• Total user tercatat: <b>{len(users)}</b>\n"
+            f"• User diblokir: <b>{len(blocked)}</b>\n"
+            f"• Total dokumen dibuat: <b>{docs}</b>\n"
+            f"• Total pesan diproses: <b>{msgs}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.MENU
+
+    if text == ADMIN_MENU_EXTRA:
+        await update.effective_message.reply_text(
+            "🧩 <b>Admin Tambahan</b>\n"
+            "Saran fitur lanjutan:\n"
+            "• Export log ringkas\n"
+            "• Reset statistik\n"
+            "• Audit perubahan admin",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.MENU
+
+    await update.effective_message.reply_text(
+        "Silakan pilih menu admin yang tersedia.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+    return AdminStates.MENU
+
+
+async def admin_whitelist_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    m = re.fullmatch(r"(allow|deny)\s+(\d+)", text, flags=re.IGNORECASE)
+    if not m:
+        await update.effective_message.reply_text(
+            "Format salah. Gunakan: <code>allow 123456789</code> / <code>deny 123456789</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.WHITELIST_INPUT
+
+    action = m.group(1).lower()
+    target = int(m.group(2))
+
+    store = load_store()
+    u = ensure_user_record(store, target)
+    u["whitelisted"] = action == "allow"
+    save_store(store)
+
+    await update.effective_message.reply_text(
+        f"✅ Whitelist user <code>{target}</code> di-set ke <b>{u['whitelisted']}</b>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+    return AdminStates.MENU
+
+
+async def admin_duration_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    m = re.fullmatch(r"(\d+)\s+(\d+)", text)
+    if not m:
+        await update.effective_message.reply_text(
+            "Format salah. Gunakan: <code>123456789 30</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.DURATION_INPUT
+
+    target = int(m.group(1))
+    days = int(m.group(2))
+    if days <= 0 or days > 3650:
+        await update.effective_message.reply_text(
+            "Durasi harus antara 1 sampai 3650 hari.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.DURATION_INPUT
+
+    store = load_store()
+    u = ensure_user_record(store, target)
+    exp = utc_now() + timedelta(days=days)
+    u["access_expires_at"] = to_utc_iso(exp)
+    save_store(store)
+
+    await update.effective_message.reply_text(
+        f"✅ Durasi akses user <code>{target}</code> diatur sampai:\n<code>{u['access_expires_at']}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+    return AdminStates.MENU
+
+
+async def admin_block_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    m = re.fullmatch(r"(block|unblock)\s+(\d+)", text, flags=re.IGNORECASE)
+    if not m:
+        await update.effective_message.reply_text(
+            "Format salah. Gunakan: <code>block 123456789</code> / <code>unblock 123456789</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.BLOCK_INPUT
+
+    action = m.group(1).lower()
+    target = int(m.group(2))
+
+    store = load_store()
+    blocked = set(store.get("blocked", []))
+    if action == "block":
+        blocked.add(target)
+    else:
+        blocked.discard(target)
+    store["blocked"] = sorted(list(blocked))
+    save_store(store)
+
+    await update.effective_message.reply_text(
+        f"✅ Status block user <code>{target}</code>: <b>{action}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+    return AdminStates.MENU
+
+
+async def admin_broadcast_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = (update.effective_message.text or "").strip()
+    if not message:
+        await update.effective_message.reply_text(
+            "Pesan broadcast tidak boleh kosong.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return AdminStates.BROADCAST_INPUT
+
+    store = load_store()
+    users = [int(uid) for uid in store.get("users", {}).keys() if uid.isdigit()]
+    success = 0
+    failed = 0
+
+    for uid in users:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📣 <b>Pengumuman Admin</b>\n\n{message}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard(is_admin=user_is_admin(uid)),
+            )
+            success += 1
+        except Exception:
+            failed += 1
+
+    store["stats"]["last_broadcast_at"] = to_utc_iso(utc_now())
+    save_store(store)
+
+    await update.effective_message.reply_text(
+        f"✅ Broadcast selesai.\nBerhasil: <b>{success}</b>\nGagal: <b>{failed}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+    return AdminStates.MENU
+
+
+# -----------------------------------------------------------------------------
+# Global Router
+# -----------------------------------------------------------------------------
 
 async def global_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Route top-level non-conversation messages:
-    - Main menu selections
-    - Submenu selections
-    - Instant payload auto-detection (3+ lines)
-    """
     text = (update.effective_message.text or "").strip()
+    uid = current_user_id(update)
+
+    # Hard reset controls
+    if text in {MAIN_MENU_START, "Start", "/start", SUBMENU_CANCEL, "Batal"}:
+        await start_handler(update, context)
+        return
 
     if text == MAIN_MENU_CREATE_DOC:
         await menu_create_doc_handler(update, context)
@@ -571,32 +1123,28 @@ async def global_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if text == SUBMENU_BACK:
         await update.effective_message.reply_text(
-            "🔙 <b>Kembali ke Menu Utama</b>",
+            "🔙 Kembali ke menu utama.",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(is_admin=user_is_admin(uid)),
         )
         return
 
     if text == SUBMENU_MANUAL:
-        # Start manual conversation by prompting; conversation entry point remains command/text-based
         await manual_start_handler(update, context)
         return
 
     if text == SUBMENU_INSTANT:
-        await instant_handler(update, context)
+        await instant_start_handler(update, context)
         return
 
-    # Auto-detect possible instant payload (3+ non-empty lines)
-    non_empty_lines = [ln for ln in text.splitlines() if ln.strip()]
-    if len(non_empty_lines) >= 3:
-        await instant_payload_handler(update, context)
+    if text == MAIN_MENU_ADMIN:
+        await admin_entry_handler(update, context)
         return
 
     await update.effective_message.reply_text(
-        "🤔 <b>Mohon maaf, saya tidak mengenali pesan Anda.</b>\n"
-        "Silakan gunakan tombol menu yang tersedia di bawah ini.",
+        "🤖 Pesan tidak dikenali. Silakan gunakan tombol menu.",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=user_is_admin(uid)),
     )
 
 
@@ -605,20 +1153,19 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # -----------------------------------------------------------------------------
-# Application Setup
+# App Setup
 # -----------------------------------------------------------------------------
 
 def build_application() -> Application:
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError(
-            "TELEGRAM_TOKEN tidak ditemukan. "
-            "Silakan isi TELEGRAM_TOKEN di environment/.env."
+            "TELEGRAM_TOKEN tidak ditemukan. Isi TELEGRAM_TOKEN di environment/.env."
         )
 
     app = Application.builder().token(token).build()
 
-    # Manual conversation flow
+    # Manual conversation
     manual_conv = ConversationHandler(
         entry_points=[
             CommandHandler("manual", manual_start_handler),
@@ -628,21 +1175,70 @@ def build_application() -> Application:
             States.ASK_UID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_uid_handler)],
             States.ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_password_handler)],
             States.ASK_COOKIE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_cookie_handler)],
+            States.ASK_FILENAME_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_filename_manual_handler)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_handler),
-            MessageHandler(filters.Regex(r"^/cancel$"), cancel_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(SUBMENU_CANCEL)}$"), cancel_handler),
+            CommandHandler("start", start_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(MAIN_MENU_START)}$"), start_handler),
         ],
         allow_reentry=True,
         name="manual_conversation",
         persistent=False,
     )
 
+    # Instant conversation
+    instant_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("instan", instant_start_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(SUBMENU_INSTANT)}$"), instant_start_handler),
+        ],
+        states={
+            States.ASK_INSTANT_PAYLOAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_instant_payload_handler)],
+            States.ASK_FILENAME_INSTANT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_filename_instant_handler)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(SUBMENU_CANCEL)}$"), cancel_handler),
+            CommandHandler("start", start_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(MAIN_MENU_START)}$"), start_handler),
+        ],
+        allow_reentry=True,
+        name="instant_conversation",
+        persistent=False,
+    )
+
+    # Admin conversation
+    admin_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("admin", admin_entry_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(MAIN_MENU_ADMIN)}$"), admin_entry_handler),
+        ],
+        states={
+            AdminStates.MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_router)],
+            AdminStates.WHITELIST_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_whitelist_input_handler)],
+            AdminStates.DURATION_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_duration_input_handler)],
+            AdminStates.BLOCK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_block_input_handler)],
+            AdminStates.BROADCAST_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_input_handler)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(SUBMENU_CANCEL)}$"), cancel_handler),
+            CommandHandler("start", start_handler),
+            MessageHandler(filters.Regex(f"^{re.escape(MAIN_MENU_START)}$"), start_handler),
+        ],
+        allow_reentry=True,
+        name="admin_conversation",
+        persistent=False,
+    )
+
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("buat", menu_create_doc_handler))
-    app.add_handler(CommandHandler("instan", instant_handler))
     app.add_handler(manual_conv)
+    app.add_handler(instant_conv)
+    app.add_handler(admin_conv)
 
     # Global text router (outside active conversation)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_text_router))
