@@ -438,7 +438,7 @@ async def inventory_start_handler(update: Update, context: ContextTypes.DEFAULT_
     buffer = _build_inventory_xlsx(entries)
     
     await update.effective_chat.send_message(
-        text=f"✨ <b>Sukses Membuat Dokumen!</b>\nTotal <b>{len(entries)}</b> akun telah dirender ke dalam Excel. Silakan unduh file Anda di bawah ini.",
+        text=f"✨ <b>Sukses Membuat Dokumen!</b>\nTotal <b>{len(entries)}</b> akun telah dirender ke dalam Excel dan <b>data inventori Anda telah di-reset (dikosongkan) otomatis</b>. Silakan unduh file Anda di bawah ini.",
         parse_mode=ParseMode.HTML,
         message_effect_id=EFFECT_TADA
     )
@@ -448,6 +448,13 @@ async def inventory_start_handler(update: Update, context: ContextTypes.DEFAULT_
         document=InputFile(buffer, filename=filename),
         reply_markup=_inventory_menu_keyboard(),
     )
+    
+    # Reset/clear the in-memory store for the user after generating the document
+    if user_id in _INVENTORY_STORE:
+        del _INVENTORY_STORE[user_id]
+    if user_id in _INVENTORY_META:
+        del _INVENTORY_META[user_id]
+
     return ConversationHandler.END
 
 
