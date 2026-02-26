@@ -37,9 +37,14 @@ from telegram.ext import (
 )
 
 INVENTORY_MENU_LABEL = "Inventori"
-INVENTORY_SUBMENU_START = "1️⃣ Start"
-INVENTORY_SUBMENU_INPUT = "2️⃣ Input"
-INVENTORY_SUBMENU_INFO = "3️⃣ Info"
+INVENTORY_SUBMENU_START = "🚀 Start"
+INVENTORY_SUBMENU_INPUT = "➕ Input"
+INVENTORY_SUBMENU_INFO = "📊 Info"
+INVENTORY_SUBMENU_BACK = "🔙 Kembali"
+
+# Telegram UI Message Effects IDs
+EFFECT_FIRE = "5104841245755180586"
+EFFECT_TADA = "5046509860389126442"
 
 PASSWORD_REGEX = re.compile(r"^[^\s]{6,64}$")
 UID_REGEX = re.compile(r"^\d{8,20}$")
@@ -91,8 +96,8 @@ def _user_id(update: Update) -> Optional[int]:
 def _inventory_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(INVENTORY_SUBMENU_START)],
             [KeyboardButton(INVENTORY_SUBMENU_INPUT), KeyboardButton(INVENTORY_SUBMENU_INFO)],
+            [KeyboardButton(INVENTORY_SUBMENU_START), KeyboardButton(INVENTORY_SUBMENU_BACK)],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -101,7 +106,13 @@ def _inventory_menu_keyboard() -> ReplyKeyboardMarkup:
 
 def _skip_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Skip", callback_data="inv_skip_password")]
+        [InlineKeyboardButton("⏭️ Skip Password", callback_data="inv_skip_password")]
+    ])
+
+
+def _inline_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Batal & Kembali", callback_data="inv_cancel_input")]
     ])
 
 
@@ -154,9 +165,12 @@ async def inventory_menu_handler(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     await update.effective_message.reply_text(
-        "📦 <b>Inventori</b>\n\nPilih submenu yang tersedia:",
+        "📦 <b>Sistem Inventori Aktif</b>\n\n"
+        "Area untuk mengumpulkan dan menyimpan sementara data akun Anda sebelum dicetak menjadi Excel.\n\n"
+        "👉 <i>Pilih aksi yang ingin Anda lakukan:</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=_inventory_menu_keyboard(),
+        message_effect_id=EFFECT_FIRE
     )
     return ConversationHandler.END
 
@@ -170,37 +184,65 @@ async def inventory_input_start_handler(update: Update, context: ContextTypes.DE
         return ConversationHandler.END
 
     context.user_data.pop("inv_pending", None)
+    
+    # Hapus ReplyKeyboard lama agar antarmuka terlihat bersih saat proses inline
+    try:
+        tmp_msg = await update.effective_message.reply_text(
+            "🔄 <i>Menyiapkan UI...</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await tmp_msg.delete()
+    except Exception:
+        pass
+
     await update.effective_message.reply_text(
-        "🧾 <b>Input Inventori - Langkah 1</b>\n\n"
-        "Silakan kirim <b>cookie lengkap</b>.",
+        "🧾 <b>Input Inventori [Langkah 1/2]</b>\n\n"
+        "👉 Silakan kirimkan <b>Cookie Lengkap</b> dari akun Anda.",
         parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=_inline_cancel_keyboard(),
     )
     return InventoryStates.ASK_COOKIE
 
 
 async def inventory_cookie_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = (update.effective_message.text or "").strip()
+    
+    # Deteksi fallback kembali
+    if raw in {INVENTORY_SUBMENU_BACK, "Batal", "/start"}:
+        await update.effective_message.reply_text(
+            "❎ Input dibatalkan.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_inventory_menu_keyboard()
+        )
+        context.user_data.pop("inv_pending", None)
+        return ConversationHandler.END
+
     ok, reason = _validate_cookie_minimal(raw)
     if not ok:
         await update.effective_message.reply_text(
-            f"❌ <b>Cookie ditolak.</b>\n💡 {reason}",
+            f"❌ <b>Cookie Ditolak.</b>\n💡 {reason}",
             parse_mode=ParseMode.HTML,
+            reply_markup=_inline_cancel_keyboard(),
         )
         return InventoryStates.ASK_COOKIE
 
     uid = _extract_uid(raw)
     if not uid:
         await update.effective_message.reply_text(
-            "❌ <b>Gagal mendeteksi UID dari cookie.</b>\n"
-            "Pastikan cookie memiliki <code>c_user=</code> yang valid.",
+            "❌ <b>Gagal Mendeteksi UID.</b>\n"
+            "Pastikan cookie memiliki <code>c_user=</code> yang terformat dengan benar.",
             parse_mode=ParseMode.HTML,
+            reply_markup=_inline_cancel_keyboard(),
         )
         return InventoryStates.ASK_COOKIE
 
     context.user_data["inv_pending"] = {"uid": uid, "cookie": raw}
     await update.effective_message.reply_text(
-        f"🔐 <b>Masukkan password untuk UID {uid}</b> atau tekan Skip.",
+        f"✅ <b>Cookie Valid!</b> (UID: <code>{uid}</code>)\n\n"
+        "🔐 <b>Input Inventori [Langkah 2/2]</b>\n"
+        "👉 Silakan masukkan <b>Password</b> untuk akun ini.\n"
+        "<i>* Anda dapat menekan tombol Skip jika tidak ingin menyertakan password.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=_skip_keyboard(),
     )
@@ -209,13 +251,22 @@ async def inventory_cookie_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def inventory_password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = (update.effective_message.text or "").strip()
+    
+    if raw in {INVENTORY_SUBMENU_BACK, "Batal", "/start"}:
+        await update.effective_message.reply_text(
+            "❎ Input dibatalkan.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_inventory_menu_keyboard()
+        )
+        context.user_data.pop("inv_pending", None)
+        return ConversationHandler.END
+
     if not PASSWORD_REGEX.fullmatch(raw):
         await update.effective_message.reply_text(
-            "❌ <b>Password tidak valid.</b>\n"
-            "📌 Syarat: 6–64 karakter dan tanpa spasi.\n"
-            "Atau gunakan tombol <b>Skip</b> jika ingin kosong.",
+            "❌ <b>Password Tidak Valid.</b>\n"
+            "📌 Syarat: 6–64 karakter dan tidak boleh ada spasi.\n"
+            "<i>(Gunakan tombol <b>Skip Password</b> di atas jika kosong)</i>",
             parse_mode=ParseMode.HTML,
-            reply_markup=_skip_keyboard(),
         )
         return InventoryStates.ASK_PASSWORD
 
@@ -224,8 +275,9 @@ async def inventory_password_handler(update: Update, context: ContextTypes.DEFAU
     cookie = pending.get("cookie", "")
     if not uid or not cookie:
         await update.effective_message.reply_text(
-            "❌ <b>Data pending tidak ditemukan.</b> Silakan ulangi input cookie.",
+            "❌ <b>Sesi Pending Hilang.</b> Silakan ulangi input dari awal.",
             parse_mode=ParseMode.HTML,
+            reply_markup=_inventory_menu_keyboard(),
         )
         return ConversationHandler.END
 
@@ -236,12 +288,13 @@ async def inventory_password_handler(update: Update, context: ContextTypes.DEFAU
     _store_entry(user_id, uid, raw, cookie)
 
     await update.effective_message.reply_text(
-        "✅ <b>Data berhasil disimpan 🎉</b>\n\n"
-        f"UID: <code>{uid}</code>\n"
-        f"Password: <code>{raw}</code>\n"
-        f"Waktu: <code>{_utc_now_iso()}</code>",
+        "✨ <b>Satu Entri Berhasil Ditambahkan ke Inventori!</b>\n\n"
+        f"👤 <b>UID:</b> <code>{uid}</code>\n"
+        f"🔑 <b>Password:</b> <code>{raw}</code>\n"
+        f"🕒 <b>Waktu:</b> <code>{_utc_now_iso()}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=_inventory_menu_keyboard(),
+        message_effect_id=EFFECT_TADA
     )
     context.user_data.pop("inv_pending", None)
     return ConversationHandler.END
@@ -249,15 +302,21 @@ async def inventory_password_handler(update: Update, context: ContextTypes.DEFAU
 
 async def inventory_password_skip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer("Password dikosongkan.", show_alert=False)
+    await query.answer("Memproses penyimpanan tanpa password...", show_alert=False)
 
     pending = context.user_data.get("inv_pending", {})
     uid = pending.get("uid", "")
     cookie = pending.get("cookie", "")
     if not uid or not cookie:
         await query.edit_message_text(
-            "❌ <b>Data pending tidak ditemukan.</b> Silakan ulangi input cookie.",
+            "❌ <b>Sesi Pending Hilang.</b> Silakan ulangi input dari awal.",
             parse_mode=ParseMode.HTML,
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="🔙 <b>Kembali ke Menu Inventori.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_inventory_menu_keyboard()
         )
         return ConversationHandler.END
 
@@ -268,21 +327,43 @@ async def inventory_password_skip_callback(update: Update, context: ContextTypes
     _store_entry(user_id, uid, "", cookie)
 
     await query.edit_message_text(
-        "✅ <b>Data berhasil disimpan 🎉</b>\n\n"
-        f"UID: <code>{uid}</code>\n"
-        f"Password: <code>(kosong)</code>\n"
-        f"Waktu: <code>{_utc_now_iso()}</code>",
+        "✨ <b>Satu Entri Berhasil Ditambahkan ke Inventori!</b>\n\n"
+        f"👤 <b>UID:</b> <code>{uid}</code>\n"
+        f"🔑 <b>Password:</b> <i>(Dikosongkan)</i>\n"
+        f"🕒 <b>Waktu:</b> <code>{_utc_now_iso()}</code>",
         parse_mode=ParseMode.HTML,
     )
+    
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text="📦 Anda kembali ke menu Inventori.",
+        text="✨ <b>Data telah diamankan di Inventori.</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=_inventory_menu_keyboard(),
+        message_effect_id=EFFECT_TADA
     )
+
     context.user_data.pop("inv_pending", None)
     return ConversationHandler.END
 
+
+async def inventory_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer("Sesi input inventori dibatalkan.", show_alert=False)
+    
+    context.user_data.pop("inv_pending", None)
+    
+    await query.edit_message_text(
+        "❎ <i>Anda membatalkan input inventori pada sesi ini.</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="🔙 <b>Kembali ke Menu Inventori.</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_inventory_menu_keyboard()
+    )
+    return ConversationHandler.END
 
 # -----------------------------------------------------------------------------
 # Start Flow (Generate XLSX)
@@ -347,19 +428,25 @@ async def inventory_start_handler(update: Update, context: ContextTypes.DEFAULT_
     entries = _INVENTORY_STORE.get(user_id, [])
     if not entries:
         await update.effective_message.reply_text(
-            "❌ <b>Inventori kosong.</b>\nMinimal harus ada 1 akun sebelum file bisa dibuat.",
+            "⚠️ <b>Inventori Anda Masih Kosong!</b>\n"
+            "Silakan tambahkan minimal 1 akun melalui menu <b>➕ Input</b> sebelum membuat file Excel.",
             parse_mode=ParseMode.HTML,
             reply_markup=_inventory_menu_keyboard(),
         )
         return ConversationHandler.END
 
     buffer = _build_inventory_xlsx(entries)
-    await update.effective_message.reply_text(
-        "✅ <b>Dokumen inventori berhasil dibuat 🎉</b>",
+    
+    await update.effective_chat.send_message(
+        text=f"✨ <b>Sukses Membuat Dokumen!</b>\nTotal <b>{len(entries)}</b> akun telah dirender ke dalam Excel. Silakan unduh file Anda di bawah ini.",
         parse_mode=ParseMode.HTML,
+        message_effect_id=EFFECT_TADA
     )
+
+    filename = f"inventory_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     await update.effective_chat.send_document(
-        document=InputFile(buffer, filename="inventori_.xlsx"),
+        document=InputFile(buffer, filename=filename),
+        reply_markup=_inventory_menu_keyboard(),
     )
     return ConversationHandler.END
 
@@ -381,19 +468,19 @@ async def inventory_info_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if not entries:
         await update.effective_message.reply_text(
-            "ℹ️ <b>Inventori masih kosong.</b>\nBelum ada akun tersimpan.",
+            "ℹ️ <b>Status Inventori Kosong</b>\nBelum ada akun yang Anda masukkan ke dalam sistem saat ini.",
             parse_mode=ParseMode.HTML,
             reply_markup=_inventory_menu_keyboard(),
         )
         return ConversationHandler.END
 
-    password_status = "kosong" if meta.last_password_empty else "ada"
+    password_status = "❌ Tidak Ada" if meta.last_password_empty else "✅ Ada"
     await update.effective_message.reply_text(
-        "📊 <b>Info Inventori</b>\n\n"
-        f"Total akun: <b>{len(entries)}</b>\n"
-        f"UID terakhir: <code>{meta.last_uid}</code>\n"
-        f"Status password terakhir: <b>{password_status}</b>\n"
-        f"Timestamp terakhir input: <code>{meta.last_input_at}</code>\n",
+        "📊 <b>Ringkasan Inventori Anda</b>\n\n"
+        f"📦 <b>Total Akun Tersimpan:</b> <code>{len(entries)}</code> akun\n"
+        f"👤 <b>UID Input Terakhir:</b> <code>{meta.last_uid}</code>\n"
+        f"🔑 <b>Status Password Terakhir:</b> {password_status}\n"
+        f"🕒 <b>Waktu Input Terakhir:</b> <code>{meta.last_input_at}</code>\n",
         parse_mode=ParseMode.HTML,
         reply_markup=_inventory_menu_keyboard(),
     )
@@ -427,6 +514,7 @@ def register_inventory_handlers(app, guard_access) -> None:
         },
         fallbacks=[
             CommandHandler("inventori", inventory_menu_handler),
+            CallbackQueryHandler(inventory_cancel_callback, pattern="^inv_cancel_input$"),
         ],
         allow_reentry=True,
         name="inventori_conversation",
