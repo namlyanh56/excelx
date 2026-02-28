@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-INVENTORY_MENU_LABEL = "Inventori"
+INVENTORY_MENU_LABEL = "📦 Stored XIE"
 INVENTORY_SUBMENU_START = "🚀 Start"
 INVENTORY_SUBMENU_INPUT = "➕ Input"
 INVENTORY_SUBMENU_INFO = "📊 Info"
@@ -591,8 +591,14 @@ def register_inventory_handlers(app, guard_access) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(INVENTORY_SUBMENU_INPUT)}$"), inventory_input_start_handler),
         ],
         states={
-            InventoryStates.ASK_COOKIE: [MessageHandler(filters.TEXT & ~filters.COMMAND, inventory_cookie_handler)],
-            InventoryStates.ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, inventory_password_handler)],
+            InventoryStates.ASK_COOKIE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, inventory_cookie_handler)
+            ],
+            InventoryStates.ASK_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, inventory_password_handler),
+                # BUGFIX: Callback skip dipindahkan ke dalam state ASK_PASSWORD
+                CallbackQueryHandler(inventory_password_skip_callback, pattern="^inv_skip_password$")
+            ],
         },
         fallbacks=[
             CommandHandler("inventori", inventory_menu_handler),
@@ -621,6 +627,3 @@ def register_inventory_handlers(app, guard_access) -> None:
         persistent=False,
     )
     app.add_handler(gen_conv)
-
-    # Skip callback
-    app.add_handler(CallbackQueryHandler(inventory_password_skip_callback, pattern="^inv_skip_password$"))
