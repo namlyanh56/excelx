@@ -249,8 +249,8 @@ def touch_user(store: dict, user_id: int | None) -> None:
 
 def main_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
+        [KeyboardButton(MAIN_MENU_INVENTORY)],  # Dipindahkan ke paling atas
         [KeyboardButton(MAIN_MENU_CREATE_DOC)],
-        [KeyboardButton(MAIN_MENU_INVENTORY)],
         [KeyboardButton(MAIN_MENU_START), KeyboardButton(MAIN_MENU_HELP)],
     ]
     if is_admin:
